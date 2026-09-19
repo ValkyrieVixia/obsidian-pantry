@@ -1,6 +1,7 @@
 import esbuild from "esbuild";
 import process from "process";
 import { builtinModules } from 'node:module';
+import { deployToTestVault } from "./scripts/deploy-dev.mjs";
 
 const banner =
 `/*
@@ -17,6 +18,14 @@ const context = await esbuild.context({
 	},
 	entryPoints: ["src/main.ts"],
 	bundle: true,
+	plugins: prod ? [] : [{
+		name: "deploy-to-test-vault",
+		setup(build) {
+			build.onEnd((result) => {
+				if (result.errors.length === 0) deployToTestVault();
+			});
+		},
+	}],
 	external: [
 		"obsidian",
 		"electron",

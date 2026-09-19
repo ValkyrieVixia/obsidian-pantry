@@ -40,17 +40,19 @@ export interface ShopLink {
 
 /**
  * A single item in the user's pantry inventory.
- * Matched to grocery lines by normalised name when {@link inStock} is true.
+ *
+ * Items live inside a section of an inventory page (a markdown note); this
+ * shape is what's actually stored per bullet line. `category` is derived
+ * automatically from the owning section's name (kept as a field so grocery
+ * matching/grouping code doesn't need to know about sections).
  */
 export interface InventoryItem {
 	id: string;
 	name: string;
-	/**
-	 * When true (default), matching grocery lines are omitted when
-	 * "Exclude in-stock from grocery list" is enabled. Uncheck when you've
-	 * run out so the next recipe pulls it back onto the list.
-	 */
-	inStock: boolean;
+	/** How much you currently have. */
+	quantity: number;
+	/** Target amount to keep on hand; 0 means "not stock-tracked". */
+	desiredQuantity: number;
 	unit: string;
 	category: string | null;
 	/** When the item was added to inventory (ISO timestamp). */
@@ -63,6 +65,37 @@ export interface InventoryItem {
 	tags: string[];
 	/** Per-item shop links, capped at 4, each opened as-is (no URL rewriting). */
 	shopLinks: ShopLink[];
+}
+
+/**
+ * A named, taggable list inside an inventory page (e.g. "Pantry", "Cabinet").
+ * Items belong to exactly one section; a section's tags act as a shared
+ * indicator/type inherited by every item in it for filtering purposes.
+ */
+export interface InventorySection {
+	name: string;
+	/** Type/indicator tags for the whole section (e.g. "shelf-stable", "cold"). */
+	tags: string[];
+	items: InventoryItem[];
+	/** Non-item lines found under this heading, preserved verbatim on save. */
+	extraLines: string[];
+}
+
+/** Parsed body of an inventory page note (frontmatter handled separately). */
+export interface InventoryPageContent {
+	/** Raw markdown before the first section heading, preserved verbatim. */
+	preamble: string;
+	/** Always has at least one entry. */
+	sections: InventorySection[];
+}
+
+/** A single item paired with the page/section it lives in, for aggregated views. */
+export interface InventoryEntry {
+	item: InventoryItem;
+	filePath: string;
+	pageName: string;
+	sectionName: string;
+	sectionTags: string[];
 }
 
 /**

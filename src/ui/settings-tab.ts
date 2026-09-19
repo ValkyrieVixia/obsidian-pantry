@@ -93,16 +93,42 @@ export class PantrySettingsTab extends PluginSettingTab {
 							this.wireShoppingStatePath(setting),
 					},
 					{
-						name: "Inventory state file",
-						desc: "Vault-relative JSON file for pantry inventory items. Stored in the vault so it syncs across devices.",
-						render: (setting) =>
-							this.wireInventoryStatePath(setting),
-					},
-					{
 						name: "Exclude in-stock from grocery list",
 						desc: "Omit grocery lines that match an inventory item marked in stock (name-only match). Uncheck an inventory item when you run out so it comes back onto the list. Complements #IgnoreIngredient for permanent per-recipe skips.",
 						render: (setting) =>
 							this.wireExcludeInStockFromGrocery(setting),
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Inventory",
+				items: [
+					{
+						name: "Inventory folders",
+						desc: "Vault-relative folder paths to scan for inventory pages, one per line. Leave blank to scan the entire vault.",
+						render: (setting) => this.wireInventoryFolders(setting),
+					},
+					{
+						name: "Inventory type property",
+						desc: "The frontmatter property name checked to identify an inventory page note (e.g. `type`, `category`, `kind`).",
+						render: (setting) => this.wireInventoryTypeProperty(setting),
+					},
+					{
+						name: "Inventory type value",
+						desc: "A note opens as an inventory page when the property above matches this value (case-insensitive).",
+						render: (setting) => this.wireInventoryTypeValue(setting),
+					},
+					{
+						name: "Auto-open inventory page view",
+						desc: "Open notes whose inventory-type frontmatter matches the property/value above in the inventory page view automatically. Only applies when a note is freshly opened — switching tabs keeps the current view.",
+						render: (setting) => this.wireAutoOpenInventoryView(setting),
+					},
+					{
+						name: "Inventory view state file",
+						desc: "Vault-relative JSON file for the inventory tab's grouping/filter/zoom preferences. Item data itself lives in your inventory page notes, not here. Stored in the vault so it syncs across devices.",
+						render: (setting) =>
+							this.wireInventoryStatePath(setting),
 					},
 				],
 			},
@@ -398,6 +424,59 @@ export class PantrySettingsTab extends PluginSettingTab {
 					await this.host.reloadInventoryState();
 					await this.host.inventoryManager.refresh();
 					this.host.manager.reapplyInventoryFilter();
+				}),
+		);
+	}
+
+	private wireInventoryFolders(setting: Setting): void {
+		setting.addTextArea((ta) => {
+			ta.setPlaceholder("One folder path per line");
+			ta.setValue(this.host.settings.inventoryFolders.join("\n"));
+			ta.onChange(async (value) => {
+				this.host.settings.inventoryFolders = value
+					.split(/\r?\n/)
+					.map((line) => line.trim())
+					.filter(Boolean);
+				await this.host.saveSettings();
+				await this.host.inventoryManager.refresh();
+			});
+			ta.inputEl.rows = 4;
+		});
+	}
+
+	private wireInventoryTypeProperty(setting: Setting): void {
+		setting.addText((text) =>
+			text
+				.setPlaceholder("Type")
+				.setValue(this.host.settings.inventoryTypeProperty)
+				.onChange(async (value) => {
+					this.host.settings.inventoryTypeProperty = value.trim() || "type";
+					await this.host.saveSettings();
+					await this.host.inventoryManager.refresh();
+				}),
+		);
+	}
+
+	private wireInventoryTypeValue(setting: Setting): void {
+		setting.addText((text) =>
+			text
+				.setPlaceholder("Inventory")
+				.setValue(this.host.settings.inventoryTypeValue)
+				.onChange(async (value) => {
+					this.host.settings.inventoryTypeValue = value.trim() || "inventory";
+					await this.host.saveSettings();
+					await this.host.inventoryManager.refresh();
+				}),
+		);
+	}
+
+	private wireAutoOpenInventoryView(setting: Setting): void {
+		setting.addToggle((toggle) =>
+			toggle
+				.setValue(this.host.settings.autoOpenInventoryView)
+				.onChange(async (value) => {
+					this.host.settings.autoOpenInventoryView = value;
+					await this.host.saveSettings();
 				}),
 		);
 	}

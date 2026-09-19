@@ -1639,10 +1639,36 @@
 }
 
 .pantry-item-grid {
-	display: grid;
-	grid-template: auto / 18px 22px minmax(80px, 1fr) 46px minmax(0, 1fr) 56px;
+	display: flex;
 	align-items: center;
 	gap: var(--size-2-2);
+}
+
+.pantry-col-status {
+	flex: 0 0 18px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.pantry-col-qty {
+	flex: 0 0 auto;
+}
+
+.pantry-col-name {
+	flex: 1 1 140px;
+	min-width: 0;
+}
+
+.pantry-col-shops {
+	flex: 1 1 100px;
+	min-width: 0;
+}
+
+.pantry-col-actions {
+	flex: 0 0 56px;
+	display: flex;
+	justify-content: flex-end;
 }
 
 .pantry-column-header {
@@ -1657,10 +1683,6 @@
 	top: 0;
 	background: var(--background-primary);
 	z-index: 1;
-}
-
-.pantry-col-right {
-	text-align: center;
 }
 
 .pantry-item-grid.pantry-item {
@@ -1679,14 +1701,54 @@
 	white-space: nowrap;
 }
 
-.pantry-inventory-stock {
-	margin: 0;
-	justify-self: center;
+.pantry-qty-stepper {
+	display: flex;
+	align-items: center;
+	gap: 1px;
+	flex-wrap: nowrap;
+	white-space: nowrap;
 }
 
-.pantry-unit {
+.pantry-qty-stepper .clickable-icon {
+	padding: 2px;
+	flex-shrink: 0;
+}
+
+.pantry-qty-have,
+.pantry-qty-want {
+	width: 3.2em;
+	text-align: center;
+	padding: 1px 2px;
+	flex-shrink: 0;
+	font-size: var(--font-ui-smaller);
+	/* Chromium/Electron's default spinner arrows eat into the visible text
+	   width, cutting off two-digit values — hide them since the stepper
+	   buttons already cover increment/decrement. */
+	-moz-appearance: textfield;
+}
+
+.pantry-qty-have::-webkit-inner-spin-button,
+.pantry-qty-have::-webkit-outer-spin-button,
+.pantry-qty-want::-webkit-inner-spin-button,
+.pantry-qty-want::-webkit-outer-spin-button {
+	-webkit-appearance: none;
+	margin: 0;
+}
+
+.pantry-qty-want {
+	width: 2.8em;
+	color: var(--text-muted);
+}
+
+.pantry-qty-sep {
+	color: var(--text-faint);
+	flex-shrink: 0;
+}
+
+.pantry-qty-unit {
 	color: var(--text-muted);
 	font-size: var(--font-ui-smaller);
+	margin-inline-start: 2px;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
@@ -1797,6 +1859,14 @@
 	gap: var(--size-4-2);
 }
 
+.pantry-header-right {
+	display: flex;
+	align-items: center;
+	gap: var(--size-4-2);
+	flex-wrap: wrap;
+	margin-inline-start: auto;
+}
+
 .pantry-shop-link-editor {
 	display: flex;
 	flex-direction: column;
@@ -1816,6 +1886,222 @@
 
 .pantry-shop-link-url {
 	flex: 1 1 auto;
+}
+
+/* ============================================================
+   Inventory view: overview/manage mode toggle, tag filters,
+   page + section editor (manage-pages mode)
+   ============================================================ */
+
+.pantry-mode-toggle {
+	display: flex;
+	gap: 2px;
+	background: var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	padding: 2px;
+}
+
+.pantry-mode-btn {
+	border: none;
+	background: transparent;
+	box-shadow: none;
+	padding: var(--size-2-1) var(--size-2-3);
+	font-size: var(--font-ui-small);
+	border-radius: var(--radius-s);
+	color: var(--text-muted);
+	cursor: pointer;
+}
+
+.pantry-mode-btn.is-active {
+	background: var(--background-primary);
+	color: var(--text-normal);
+	font-weight: var(--font-semibold);
+}
+
+.pantry-tag-filters {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: var(--size-2-1);
+	margin-bottom: var(--size-2-2);
+}
+
+.pantry-tag-chip {
+	border: 1px solid var(--background-modifier-border);
+	background: var(--background-secondary);
+	color: var(--text-muted);
+	border-radius: var(--radius-l, 999px);
+	padding: 1px var(--size-2-3);
+	font-size: var(--font-ui-smaller);
+	cursor: pointer;
+	box-shadow: none;
+}
+
+.pantry-tag-chip.is-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent, #ffffff);
+	border-color: transparent;
+}
+
+.pantry-filter-label {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	text-transform: uppercase;
+	letter-spacing: 0.03em;
+	flex: 0 0 auto;
+	min-width: 4.5em;
+}
+
+.pantry-section-filters {
+	margin-top: 0;
+}
+
+/*
+ * Inventory groups (by section/tag) use a much lighter treatment than the
+ * grocery list's collapsible sections: a thin divider line and small muted
+ * label, not a filled header pill — just enough to mark where one group
+ * ends and the next begins without adding visual weight.
+ */
+.pantry-inventory-list .pantry-group {
+	border-top: 1px solid var(--background-modifier-border);
+	padding-top: var(--size-2-2);
+	margin-top: var(--size-2-2);
+}
+
+.pantry-inventory-list .pantry-group:first-of-type {
+	border-top: none;
+	margin-top: 0;
+	padding-top: 0;
+}
+
+.pantry-inventory-list .pantry-group-header {
+	background: transparent;
+	padding: 0 var(--size-2-2) var(--size-2-1);
+	margin: 0 0 var(--size-2-1) 0;
+	color: var(--text-faint);
+}
+
+.pantry-inventory-list .pantry-group-header:hover {
+	background: transparent;
+	color: var(--text-muted);
+}
+
+.pantry-inventory-list .pantry-group-title {
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-medium, 500);
+}
+
+.pantry-inventory-list .pantry-chevron {
+	width: 10px;
+	height: 10px;
+}
+
+.pantry-name-wrap {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.pantry-name-wrap .pantry-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.pantry-item-location {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.pantry-page-selector {
+	display: flex;
+	align-items: center;
+	gap: var(--size-2-1);
+	margin-bottom: var(--size-4-2);
+}
+
+.pantry-page-picker-btn {
+	font-weight: var(--font-semibold);
+}
+
+.pantry-section-card {
+	background: var(--background-secondary);
+	border-radius: var(--radius-m);
+	padding: var(--size-4-2);
+	margin-bottom: var(--size-4-3);
+}
+
+.pantry-section-header {
+	display: flex;
+	align-items: center;
+	gap: var(--size-2-2);
+	margin-bottom: var(--size-2-3);
+}
+
+.pantry-section-name {
+	font-size: var(--font-ui-medium);
+	font-weight: var(--font-semibold);
+	border: none;
+	background: transparent;
+	box-shadow: none;
+	padding: var(--size-2-1);
+	flex: 0 1 auto;
+	min-width: 4em;
+}
+
+.pantry-section-tags {
+	flex: 1 1 auto;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	border: none;
+	background: transparent;
+	box-shadow: none;
+	padding: var(--size-2-1);
+}
+
+.pantry-section-name:hover,
+.pantry-section-name:focus,
+.pantry-section-tags:hover,
+.pantry-section-tags:focus {
+	background: var(--background-modifier-hover);
+	border-radius: var(--radius-s);
+}
+
+.pantry-section-empty {
+	padding: var(--size-2-3);
+	font-size: var(--font-ui-small);
+}
+
+.pantry-quick-add {
+	display: flex;
+	align-items: center;
+	gap: var(--size-2-2);
+	margin-top: var(--size-2-2);
+}
+
+.pantry-quick-add-input {
+	flex: 1 1 auto;
+}
+
+.pantry-add-section-row {
+	margin-top: 0;
+	margin-bottom: var(--size-4-3);
+}
+
+.pantry-inventory-page-view .pantry-inventory-list {
+	padding: var(--size-4-1) 0;
+}
+
+.pantry-page-view-header {
+	margin-bottom: var(--size-4-2);
+}
+
+.pantry-page-view-header .pantry-title {
+	margin: 0;
 }
 
 /*

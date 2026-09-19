@@ -1,12 +1,9 @@
 import { normaliseName } from "../parser/ingredient";
 import { GroceryItem, InventoryItem } from "../types";
 
-/**
- * Whether an inventory item should suppress matching grocery lines.
- * Defaults to in-stock when the field is missing (legacy inventory JSON).
- */
+/** Whether an inventory item currently has any of it on hand. */
 export function isInventoryInStock(item: InventoryItem): boolean {
-	return item.inStock !== false;
+	return (item.quantity || 0) > 0;
 }
 
 /** Normalised names of inventory items currently marked in stock. */

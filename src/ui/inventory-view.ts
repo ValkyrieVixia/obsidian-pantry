@@ -1,25 +1,28 @@
 import {
+	App,
 	ButtonComponent,
 	EventRef,
 	ItemView,
 	Menu,
+	Modal,
 	Notice,
+	Setting,
 	WorkspaceLeaf,
 	setIcon,
 } from "obsidian";
 import { InventoryManager } from "../grocery/inventory-manager";
 import { PantrySettings } from "../settings";
-import { InventoryItem } from "../types";
 import { toTitleCase } from "../utils/text";
-import {
-	getItemStatus,
-	getStatusClass,
-	getStatusIcon,
-	getStatusLabel,
-} from "../utils/inventory-status";
-import { renderShopLinkButtons } from "./shop-link-buttons";
+import { ItemStatus, getItemStatus } from "../utils/inventory-status";
 import { AddItemModal } from "./add-inventory-item-modal";
 import { ConfirmModal } from "./confirm-modal";
+import {
+	RowContext,
+	renderItemRow,
+	renderSectionCard,
+	restoreFocus,
+	wireQuickAddRow,
+} from "./inventory-item-row";
 
 export const VIEW_TYPE_INVENTORY = "pantry-inventory";
 
@@ -34,15 +37,14 @@ export class InventoryView extends ItemView {
 	private headerEl!: HTMLElement;
 	private summaryEl!: HTMLElement;
 	private changedRef: EventRef | null = null;
-	/** Item id to refocus after a re-render triggered by keyboard/stepper edits. */
-	private focusedItemId: string | null = null;
-	/** Shared floating panel showing item details on hover. */
-	private hoverCardEl!: HTMLElement;
-	private hoverTimer: number | null = null;
+	/** Which top-level surface is showing: the aggregated overview, or the per-page editor. */
+	private mode: "overview" | "manage" = "overview";
+	/** Page currently open in "Manage pages" mode. */
+	private managedPagePath: string | null = null;
+	/** Shared context (hover card, focus tracking) for row/section-card rendering helpers. */
+	private rowCtx!: RowContext;
 	private zoomLabelEl!: HTMLElement;
 
-	/** Delay (ms) before hover card appears on row mouseover. */
-	private static readonly HOVER_CARD_DELAY_MS = 1500;
 	/** Row density zoom step (±10%). */
 	private static readonly ROW_SCALE_STEP = 0.1;
 	/** Minimum row density scale. */
@@ -77,27 +79,52 @@ export class InventoryView extends ItemView {
 		this.summaryEl = root.createDiv({ cls: "pantry-summary" });
 		this.listEl = root.createDiv({ cls: "pantry-inventory-list" });
 
-		this.hoverCardEl = document.body.createDiv({ cls: "pantry-hover-card" });
-		this.hoverCardEl.addClass("is-hidden");
+		const hoverCardEl = document.body.createDiv({ cls: "pantry-hover-card" });
+		hoverCardEl.addClass("is-hidden");
+		this.rowCtx = {
+			app: this.app,
+			manager: this.deps.manager,
+			hoverCardEl,
+			hover: { timer: null },
+			focus: { key: null },
+			getScopeEl: () => this.listEl,
+		};
+
+		this.managedPagePath = this.deps.manager.getLastManagedPage() || null;
 
 		this.renderHeader();
 
 		this.changedRef = this.deps.manager.on("changed", () => {
-			this.renderList();
+			this.render();
 		});
 
 		await this.deps.manager.refresh();
-		this.renderList();
+		this.render();
 	}
 
 	onClose(): Promise<void> {
 		if (this.changedRef) {
 			this.deps.manager.offref(this.changedRef);
 		}
-		this.cancelHoverCard();
-		this.hoverCardEl.remove();
+		if (this.rowCtx.hover.timer !== null) window.clearTimeout(this.rowCtx.hover.timer);
+		this.rowCtx.hoverCardEl.remove();
 		return Promise.resolve();
 	}
+
+	private render(): void {
+		if (this.mode === "overview") this.renderOverview();
+		else this.renderManage();
+	}
+
+	private setMode(mode: "overview" | "manage"): void {
+		this.mode = mode;
+		this.renderHeader();
+		this.render();
+	}
+
+	// ------------------------------------------------------------------
+	// Header
+	// ------------------------------------------------------------------
 
 	private renderHeader(): void {
 		this.headerEl.empty();
@@ -106,34 +133,50 @@ export class InventoryView extends ItemView {
 			cls: "pantry-header-content",
 		});
 		titleWrap.createEl("h2", {
-			text: "Pantry inventory",
+			text: "Inventory",
 			cls: "pantry-title",
 		});
 
-		const actions = this.headerEl.createDiv({ cls: "pantry-actions" });
+		const rightGroup = this.headerEl.createDiv({ cls: "pantry-header-right" });
 
-		const addBtn = new ButtonComponent(actions)
-			.setButtonText("Add item")
-			.onClick(() => this.openAddItemModal());
-		addBtn.buttonEl.addClass("pantry-add");
+		const modeToggle = rightGroup.createDiv({ cls: "pantry-mode-toggle" });
+		const overviewBtn = modeToggle.createEl("button", {
+			cls: `pantry-mode-btn${this.mode === "overview" ? " is-active" : ""}`,
+			text: "Overview",
+		});
+		overviewBtn.addEventListener("click", () => this.setMode("overview"));
+		const manageBtn = modeToggle.createEl("button", {
+			cls: `pantry-mode-btn${this.mode === "manage" ? " is-active" : ""}`,
+			text: "Manage",
+		});
+		manageBtn.addEventListener("click", () => this.setMode("manage"));
 
-		new ButtonComponent(actions)
-			.setIcon("layers")
-			.setTooltip("Group by")
-			.onClick((evt) => this.openGroupByMenu(evt));
+		const actions = rightGroup.createDiv({ cls: "pantry-actions" });
 
-		this.renderZoomControls(actions);
+		if (this.mode === "overview") {
+			const addBtn = new ButtonComponent(actions)
+				.setIcon("plus")
+				.setTooltip("Add item")
+				.onClick(() => this.openAddItemModal());
+			addBtn.buttonEl.addClass("pantry-add");
 
-		new ButtonComponent(actions)
-			.setIcon("clipboard-list")
-			.setTooltip("Copy out-of-stock list to clipboard")
-			.onClick(() => void this.exportOutOfStockList());
+			new ButtonComponent(actions)
+				.setIcon("layers")
+				.setTooltip("Group by")
+				.onClick((evt) => this.openGroupByMenu(evt));
 
-		const clearBtn = new ButtonComponent(actions)
-			.setIcon("trash-2")
-			.setTooltip("Clear inventory")
-			.onClick(() => this.openClearConfirm());
-		clearBtn.buttonEl.addClass("pantry-clear");
+			this.renderZoomControls(actions);
+
+			new ButtonComponent(actions)
+				.setIcon("clipboard-list")
+				.setTooltip("Copy restock list to clipboard")
+				.onClick(() => void this.exportRestockList());
+		} else {
+			const newPageBtn = new ButtonComponent(actions)
+				.setButtonText("New page")
+				.onClick(() => this.openNewPageModal());
+			newPageBtn.buttonEl.addClass("pantry-add");
+		}
 	}
 
 	private renderZoomControls(parent: HTMLElement): void {
@@ -174,8 +217,9 @@ export class InventoryView extends ItemView {
 	private openGroupByMenu(evt: MouseEvent): void {
 		const menu = new Menu();
 		const current = this.deps.getSettings().inventoryState.groupBy;
-		const options: Array<["category" | "tag", string]> = [
-			["category", "By category"],
+		const options: Array<["flat" | "section" | "tag", string]> = [
+			["flat", "Alphabetical"],
+			["section", "By page/section"],
 			["tag", "By tag"],
 		];
 		for (const [value, label] of options) {
@@ -191,294 +235,316 @@ export class InventoryView extends ItemView {
 		menu.showAtMouseEvent(evt);
 	}
 
-	private renderList(): void {
-		this.listEl.empty();
+	// ------------------------------------------------------------------
+	// Overview mode — aggregated, filterable master list
+	// ------------------------------------------------------------------
 
-		const items = this.deps.manager.getItems();
-		const groupedItems = this.deps.manager.getGroupedItems(
-			this.deps.getSettings(),
-		);
+	private renderOverview(): void {
+		this.listEl.empty();
+		this.summaryEl.empty();
+
 		const rowScale = this.deps.getSettings().inventoryState.rowScale;
 		this.listEl.style.setProperty("zoom", String(rowScale));
-		this.zoomLabelEl.setText(`${Math.round(rowScale * 100)}%`);
+		if (this.zoomLabelEl) this.zoomLabelEl.setText(`${Math.round(rowScale * 100)}%`);
 
-		// Render summary
-		this.summaryEl.empty();
+		this.renderSectionFilters(this.summaryEl);
+		this.renderTagFilters(this.summaryEl);
+
+		const allEntries = this.deps.manager.getEntries();
+		const entries = this.deps.manager.getFilteredEntries();
 		this.summaryEl.createEl("p", {
-			text: `${items.length} item${items.length !== 1 ? "s" : ""} in inventory`,
+			text: `${entries.length} item${entries.length !== 1 ? "s" : ""} in inventory`,
 		});
 
-		if (items.length === 0) {
+		if (allEntries.length === 0) {
 			this.listEl.createDiv({
 				cls: "pantry-empty",
-				text: "No items in inventory yet. Add some to get started.",
+				text: "No inventory items yet. Add one, or switch to Manage to set up your first inventory page and sections.",
+			});
+			return;
+		}
+		if (entries.length === 0) {
+			this.listEl.createDiv({
+				cls: "pantry-empty",
+				text: "No items match the selected filters.",
 			});
 			return;
 		}
 
 		this.renderColumnHeader();
 
-		// Render grouped items
-		for (const [groupName, groupItems] of groupedItems) {
-			if (groupItems.length === 0) continue;
+		const groupBy = this.deps.getSettings().inventoryState.groupBy;
+		const showLocation = groupBy !== "section";
+		const grouped = this.deps.manager.getGroupedEntries();
+
+		for (const [groupName, groupEntries] of grouped) {
+			if (groupEntries.length === 0) continue;
+
+			if (groupBy === "flat") {
+				const ul = this.listEl.createEl("ul", { cls: "pantry-items" });
+				for (const entry of groupEntries) {
+					renderItemRow(this.rowCtx, ul, entry, { showLocation });
+				}
+				continue;
+			}
 
 			const group = this.listEl.createDiv({
 				cls: `pantry-group${
-					this.deps.manager.isGroupCollapsed(groupName)
-						? " is-collapsed"
-						: ""
+					this.deps.manager.isGroupCollapsed(groupName) ? " is-collapsed" : ""
 				}`,
 			});
 
-			// Group header
-			const header = group.createEl("button", {
-				cls: "pantry-group-header",
-			});
-			header.addEventListener("click", () =>
-				this.toggleGroupCollapsed(groupName),
-			);
+			const header = group.createEl("button", { cls: "pantry-group-header" });
+			header.addEventListener("click", () => this.toggleGroupCollapsed(groupName));
 
 			const chevron = header.createSpan({ cls: "pantry-chevron" });
 			setIcon(chevron, "chevron-down");
 
-			header.createEl("h3", {
-				text: groupName,
-				cls: "pantry-group-title",
-			});
+			header.createEl("h3", { text: groupName, cls: "pantry-group-title" });
+			header.createSpan({ cls: "pantry-group-count", text: String(groupEntries.length) });
 
-			header.createSpan({
-				cls: "pantry-group-count",
-				text: String(groupItems.length),
-			});
-
-			// Items list
 			const itemsList = group.createEl("ul", { cls: "pantry-items" });
-			for (const item of groupItems) {
-				this.renderItem(itemsList, item);
+			for (const entry of groupEntries) {
+				renderItemRow(this.rowCtx, itemsList, entry, { showLocation });
 			}
 		}
 
-		// Restore keyboard focus after a stock-toggle re-render.
-		if (this.focusedItemId) {
-			const row = this.listEl.querySelector<HTMLElement>(
-				`[data-item-id="${CSS.escape(this.focusedItemId)}"]`,
-			);
-			row?.focus({ preventScroll: true });
+		restoreFocus(this.rowCtx);
+	}
+
+	/**
+	 * Shared rendering for a filter chip row: a small "All" chip (active
+	 * when nothing is selected) plus one chip per option. Clicking a chip
+	 * toggles it on/off; picking any specific chip turns "All" off and
+	 * narrows the list to what's selected (OR-match).
+	 */
+	private renderChipFilter(
+		container: HTMLElement,
+		label: string,
+		options: Array<{ key: string; text: string; title?: string }>,
+		selected: string[],
+		onToggle: (key: string) => void,
+		onReset: () => void,
+		extraClass?: string,
+	): void {
+		if (options.length === 0) return;
+
+		const wrap = container.createDiv({
+			cls: `pantry-tag-filters${extraClass ? ` ${extraClass}` : ""}`,
+		});
+		wrap.createSpan({ cls: "pantry-filter-label", text: label });
+
+		const allChip = wrap.createEl("button", {
+			cls: `pantry-tag-chip${selected.length === 0 ? " is-active" : ""}`,
+			text: "All",
+		});
+		allChip.addEventListener("click", () => onReset());
+
+		for (const opt of options) {
+			const isSelected = selected.includes(opt.key);
+			const chip = wrap.createEl("button", {
+				cls: `pantry-tag-chip${isSelected ? " is-active" : ""}`,
+				text: opt.text,
+				attr: opt.title ? { title: opt.title } : undefined,
+			});
+			chip.addEventListener("click", () => onToggle(opt.key));
 		}
+	}
+
+	private renderTagFilters(container: HTMLElement): void {
+		const tags = this.deps.manager.getKnownTags();
+		this.renderChipFilter(
+			container,
+			"Tags",
+			tags.map((t) => ({ key: t, text: t })),
+			this.deps.getSettings().inventoryState.filterTags,
+			(key) => void this.deps.manager.toggleFilterTag(key),
+			() => void this.deps.manager.setFilterTags([]),
+		);
+	}
+
+	/** Section chips: a temporary scope filter ("just show me a subset of my inventory right now"). */
+	private renderSectionFilters(container: HTMLElement): void {
+		const sections = this.deps.manager.getKnownSections();
+		if (sections.length <= 1) return;
+		this.renderChipFilter(
+			container,
+			"Sections",
+			sections.map((s) => ({
+				key: s.key,
+				text: s.sectionName,
+				title: `${s.pageName} › ${s.sectionName}`,
+			})),
+			this.deps.getSettings().inventoryState.sectionFilter,
+			(key) => void this.deps.manager.toggleSectionFilter(key),
+			() => void this.deps.manager.setSectionFilter([]),
+			"pantry-section-filters",
+		);
 	}
 
 	/** Column titles matching each row's grid layout, for a spreadsheet-like look. */
 	private renderColumnHeader(): void {
 		const row = this.listEl.createDiv({ cls: "pantry-item-grid pantry-column-header" });
-		row.createSpan(); // status column
-		row.createSpan({ text: "In", cls: "pantry-col-right", attr: { title: "In stock" } });
-		row.createSpan({ text: "Name" });
-		row.createSpan({ text: "Unit" });
-		row.createSpan({ text: "Shops" });
-		row.createSpan(); // actions column
+		row.createSpan({ cls: "pantry-col-status" });
+		row.createSpan({ cls: "pantry-col-qty", text: "Qty" });
+		row.createSpan({ cls: "pantry-col-name", text: "Name" });
+		row.createSpan({ cls: "pantry-col-shops", text: "Shops" });
+		row.createSpan({ cls: "pantry-col-actions" });
 	}
 
-	private renderItem(container: HTMLElement, item: InventoryItem): void {
-		const li = container.createEl("li", {
-			cls: "pantry-item pantry-item-grid",
-			attr: { tabindex: "0" },
-		});
-		li.dataset.itemId = item.id;
+	private toggleGroupCollapsed(groupName: string): void {
+		const isCollapsed = this.deps.manager.isGroupCollapsed(groupName);
+		void this.deps.manager.setGroupCollapsed(groupName, !isCollapsed);
+	}
 
-		li.addEventListener("focus", () => {
-			this.focusedItemId = item.id;
-		});
-		li.addEventListener("keydown", (evt) => this.onRowKeydown(evt, li));
-		li.addEventListener("mouseenter", () => this.scheduleHoverCard(li, item));
-		li.addEventListener("mouseleave", () => this.cancelHoverCard());
+	// ------------------------------------------------------------------
+	// Manage mode — per-page section editor
+	// ------------------------------------------------------------------
 
-		// Status indicator (color-coded icon)
-		const status = getItemStatus(item);
-		const statusIcon = li.createSpan({ cls: "pantry-item-status" });
-		statusIcon.addClass(getStatusClass(status));
-		setIcon(statusIcon, getStatusIcon(status));
-		statusIcon.setAttribute("title", getStatusLabel(status));
+	private renderManage(): void {
+		this.listEl.empty();
+		this.summaryEl.empty();
 
-		const stock = li.createEl("input", {
-			cls: "pantry-inventory-stock",
-			type: "checkbox",
-			attr: {
-				title: "In stock — when checked, matching grocery lines are omitted",
-				"aria-label": "In stock",
-			},
-		});
-		stock.checked = item.inStock !== false;
-		stock.addEventListener("change", () => {
-			void this.deps.manager.updateItem(item.id, {
-				inStock: stock.checked,
+		const pages = this.deps.manager.getPages();
+		if (pages.length === 0) {
+			this.listEl.createDiv({
+				cls: "pantry-empty",
+				text: "No inventory pages yet. Create one to start organizing items into sections.",
 			});
-		});
-
-		li.createSpan({
-			cls: "pantry-name",
-			text: toTitleCase(item.name),
-		});
-
-		li.createSpan({ cls: "pantry-unit", text: item.unit || "—" });
-
-		const shopsEl = li.createDiv({ cls: "pantry-shop-links" });
-		renderShopLinkButtons(shopsEl, item.shopLinks);
-
-		// Action buttons
-		const actions = li.createDiv({ cls: "pantry-item-actions" });
-
-		const editBtn = actions.createEl("button", {
-			cls: "clickable-icon",
-			attr: { title: "Edit item" },
-		});
-		setIcon(editBtn, "pencil");
-		editBtn.addEventListener("click", () => this.openEditItemModal(item));
-
-		const removeBtn = actions.createEl("button", {
-			cls: "clickable-icon pantry-remove",
-			attr: { title: "Remove item" },
-		});
-		setIcon(removeBtn, "trash-2");
-		removeBtn.addEventListener("click", () => this.removeItem(item.id));
-	}
-
-	/** Arrow keys move focus between rows. */
-	private onRowKeydown(evt: KeyboardEvent, row: HTMLElement): void {
-		switch (evt.key) {
-			case "ArrowUp":
-				evt.preventDefault();
-				this.focusAdjacentRow(row, -1);
-				break;
-			case "ArrowDown":
-				evt.preventDefault();
-				this.focusAdjacentRow(row, 1);
-				break;
-		}
-	}
-
-	private focusAdjacentRow(current: HTMLElement, delta: number): void {
-		const rows = Array.from(
-			this.listEl.querySelectorAll<HTMLElement>(
-				".pantry-group:not(.is-collapsed) .pantry-item",
-			),
-		);
-		const idx = rows.indexOf(current);
-		if (idx === -1) return;
-		const next = rows[idx + delta];
-		next?.focus();
-	}
-
-	private scheduleHoverCard(row: HTMLElement, item: InventoryItem): void {
-		this.cancelHoverCard();
-		this.hoverTimer = window.setTimeout(() => {
-			this.showHoverCard(row, item);
-		}, InventoryView.HOVER_CARD_DELAY_MS);
-	}
-
-	private cancelHoverCard(): void {
-		if (this.hoverTimer !== null) {
-			window.clearTimeout(this.hoverTimer);
-			this.hoverTimer = null;
-		}
-		this.hoverCardEl.addClass("is-hidden");
-	}
-
-	/**
-	 * Quick-glance details on hover — shop links are deliberately omitted.
-	 * Card appears after HOVER_CARD_DELAY_MS, positioned below the row and nudged
-	 * on-screen via requestAnimationFrame after rendering to get accurate size.
-	 */
-	private showHoverCard(row: HTMLElement, item: InventoryItem): void {
-		const card = this.hoverCardEl;
-		card.empty();
-		card.removeClass("is-hidden");
-
-		card.createDiv({ cls: "pantry-hover-card-title", text: toTitleCase(item.name) });
-
-		const rows: Array<[string, string]> = [
-			["In stock", item.inStock !== false ? "Yes" : "No"],
-			["Category", item.category || "Uncategorized"],
-		];
-		if (item.unit) rows.push(["Unit", item.unit]);
-		if (item.expirationDate) rows.push(["Expires", item.expirationDate]);
-		if (item.tags.length) rows.push(["Tags", item.tags.join(", ")]);
-		if (item.notes) rows.push(["Notes", item.notes]);
-
-		for (const [label, value] of rows) {
-			const r = card.createDiv({ cls: "pantry-hover-card-row" });
-			r.createSpan({ cls: "pantry-hover-card-label", text: label });
-			r.createSpan({ cls: "pantry-hover-card-value", text: value });
-		}
-
-		const rect = row.getBoundingClientRect();
-		const left = `${rect.left}px`;
-		const top = `${rect.bottom + 4}px`;
-		card.style.setProperty("left", left);
-		card.style.setProperty("top", top);
-
-		// Position check: shift card on-screen if it overflows after the browser
-		// renders its actual size. Use requestAnimationFrame to ensure layout is
-		// computed before repositioning.
-		window.requestAnimationFrame(() => {
-			const cardRect = card.getBoundingClientRect();
-			if (cardRect.right > window.innerWidth) {
-				const nextLeft = `${Math.max(4, window.innerWidth - cardRect.width - 8)}px`;
-				card.style.setProperty("left", nextLeft);
-			}
-			if (cardRect.bottom > window.innerHeight) {
-				const nextTop = `${Math.max(4, rect.top - cardRect.height - 4)}px`;
-				card.style.setProperty("top", nextTop);
-			}
-		});
-	}
-
-	private toggleGroupCollapsed(category: string): void {
-		const isCollapsed =
-			this.deps.manager.isGroupCollapsed(category);
-		void this.deps.manager.setGroupCollapsed(category, !isCollapsed);
-	}
-
-	private openAddItemModal(): void {
-		new AddItemModal(this.app, async (item) => {
-			try {
-				await this.deps.manager.addItem(item);
-				new Notice(`Added ${item.name} to inventory`);
-			} catch (e) {
-				new Notice(`Error adding item: ${String(e)}`);
-			}
-		}).open();
-	}
-
-	private openEditItemModal(item: InventoryItem): void {
-		new AddItemModal(
-			this.app,
-			async (updatedItem) => {
-				try {
-					await this.deps.manager.updateItem(item.id, updatedItem);
-					new Notice(`Updated ${updatedItem.name}`);
-				} catch (e) {
-					new Notice(`Error updating item: ${String(e)}`);
-				}
-			},
-			item,
-		).open();
-	}
-
-	/** Copy out-of-stock items (and their shop links) to the clipboard. */
-	private async exportOutOfStockList(): Promise<void> {
-		const outOfStock = this.deps.manager
-			.getItems()
-			.filter((item) => item.inStock === false);
-
-		if (outOfStock.length === 0) {
-			new Notice("Nothing marked out of stock.");
+			const createBtn = this.listEl.createEl("button", {
+				cls: "mod-cta",
+				text: "Create your first inventory page",
+			});
+			createBtn.addEventListener("click", () => this.openNewPageModal());
 			return;
 		}
 
-		const lines: string[] = ["Out of stock:"];
-		for (const item of outOfStock) {
-			const unitSuffix = item.unit ? ` (${item.unit})` : "";
-			lines.push(`- ${toTitleCase(item.name)}${unitSuffix}`);
+		if (!this.managedPagePath || !pages.some((p) => p.file.path === this.managedPagePath)) {
+			this.managedPagePath = pages[0]?.file.path ?? null;
+		}
+		const current = pages.find((p) => p.file.path === this.managedPagePath);
+		if (!current) return;
+
+		this.renderPageSelector(this.summaryEl, pages, current.file.path, current.file.basename);
+
+		for (const section of current.page.sections) {
+			renderSectionCard(this.rowCtx, this.listEl, current.file.path, current.file.basename, section);
+		}
+
+		const addSectionRow = this.listEl.createDiv({ cls: "pantry-quick-add pantry-add-section-row" });
+		wireQuickAddRow(this.rowCtx, addSectionRow, "New section name…", (name) => {
+			void this.deps.manager.addSection(current.file.path, name, []);
+		});
+	}
+
+	private renderPageSelector(
+		container: HTMLElement,
+		pages: ReturnType<InventoryManager["getPages"]>,
+		currentPath: string,
+		currentName: string,
+	): void {
+		const row = container.createDiv({ cls: "pantry-page-selector" });
+
+		const pageBtn = new ButtonComponent(row)
+			.setButtonText(currentName)
+			.setIcon("chevron-down");
+		pageBtn.buttonEl.addClass("pantry-page-picker-btn");
+		pageBtn.onClick((evt) => {
+			const menu = new Menu();
+			for (const p of pages) {
+				menu.addItem((item) =>
+					item
+						.setTitle(p.file.basename)
+						.setChecked(p.file.path === currentPath)
+						.onClick(() => {
+							this.managedPagePath = p.file.path;
+							void this.deps.manager.setLastManagedPage(p.file.path);
+							this.render();
+						}),
+				);
+			}
+			menu.addSeparator();
+			menu.addItem((item) =>
+				item
+					.setTitle("New inventory page…")
+					.setIcon("plus")
+					.onClick(() => this.openNewPageModal()),
+			);
+			menu.showAtMouseEvent(evt);
+		});
+
+		new ButtonComponent(row)
+			.setIcon("file-text")
+			.setTooltip("Open note")
+			.onClick(() => {
+				void this.app.workspace.getLeaf(false).openFile(pages.find((p) => p.file.path === currentPath)!.file);
+			});
+
+		new ButtonComponent(row)
+			.setIcon("trash-2")
+			.setTooltip("Delete this page")
+			.onClick(() => this.confirmDeletePage(currentPath, currentName));
+	}
+
+	private confirmDeletePage(filePath: string, basename: string): void {
+		new ConfirmModal(this.app, {
+			title: "Delete inventory page",
+			message: `Move "${basename}" to trash? It's removed from the inventory tab; the note itself goes to system trash and can be recovered.`,
+			confirmText: "Delete page",
+			destructive: true,
+			onConfirm: async () => {
+				await this.deps.manager.deletePage(filePath);
+				if (this.managedPagePath === filePath) this.managedPagePath = null;
+				new Notice(`Deleted "${basename}"`);
+			},
+		}).open();
+	}
+
+	private openNewPageModal(): void {
+		const pages = this.deps.manager.getPages();
+		const defaultFolder =
+			pages[0]?.file.parent?.path ?? this.deps.getSettings().inventoryFolders[0] ?? "";
+		new NewInventoryPageModal(this.app, defaultFolder, async (name, folder, sectionName) => {
+			const file = await this.deps.manager.createPage(name, folder, sectionName);
+			this.managedPagePath = file.path;
+			void this.deps.manager.setLastManagedPage(file.path);
+			this.mode = "manage";
+			this.renderHeader();
+			this.render();
+			new Notice(`Created inventory page "${file.basename}"`);
+		}).open();
+	}
+
+	private openAddItemModal(filePath?: string, sectionName?: string): void {
+		const pages = this.deps.manager.getPages();
+		const defaultFile = filePath ?? this.managedPagePath ?? pages[0]?.file.path ?? "";
+		const page = pages.find((p) => p.file.path === defaultFile)?.page;
+		const defaultSection = sectionName ?? page?.sections[0]?.name ?? "Items";
+		new AddItemModal(this.app, this.deps.manager, {
+			filePath: defaultFile,
+			sectionName: defaultSection,
+		}).open();
+	}
+
+	/** Copy a restock list (out-of-stock and low items) to the clipboard. */
+	private async exportRestockList(): Promise<void> {
+		const restockItems = this.deps.manager.getItems().filter((item) => {
+			const status = getItemStatus(item);
+			return status === ItemStatus.OUT_OF_STOCK || status === ItemStatus.LOW;
+		});
+
+		if (restockItems.length === 0) {
+			new Notice("Nothing needs restocking.");
+			return;
+		}
+
+		const lines: string[] = ["Restock list:"];
+		for (const item of restockItems) {
+			const missing = Math.max(0, (item.desiredQuantity || 0) - (item.quantity || 0));
+			const unitSuffix = item.unit ? ` ${item.unit}` : "";
+			lines.push(
+				`- ${toTitleCase(item.name)}: need ${missing}${unitSuffix} (have ${item.quantity || 0}, want ${item.desiredQuantity || 0})`,
+			);
 			if (item.shopLinks.length > 0) {
 				const shopText = item.shopLinks
 					.map((l) => `${l.nickname || "Shop"}: ${l.url}`)
@@ -490,46 +556,83 @@ export class InventoryView extends ItemView {
 		try {
 			await navigator.clipboard.writeText(lines.join("\n"));
 			new Notice(
-				`Copied out-of-stock list (${outOfStock.length} item${outOfStock.length === 1 ? "" : "s"}) to clipboard.`,
+				`Copied restock list (${restockItems.length} item${restockItems.length === 1 ? "" : "s"}) to clipboard.`,
 			);
 		} catch (e) {
 			new Notice(`Could not copy to clipboard: ${String(e)}`);
 		}
 	}
+}
 
-	private removeItem(id: string): void {
-		new ConfirmModal(this.app, {
-			title: "Remove item",
-			message:
-				"Are you sure you want to remove this item from inventory?",
-			confirmText: "Remove",
-			destructive: true,
-			onConfirm: async () => {
-				try {
-					await this.deps.manager.removeItem(id);
-					new Notice("Item removed from inventory");
-				} catch (e) {
-					new Notice(`Error removing item: ${String(e)}`);
-				}
-			},
-		}).open();
+/** Small modal collecting a name/folder/first-section-name for a brand-new inventory page. */
+class NewInventoryPageModal extends Modal {
+	private name = "";
+	private folder: string;
+	private sectionName = "Items";
+
+	constructor(
+		app: App,
+		defaultFolder: string,
+		private readonly onCreate: (
+			name: string,
+			folder: string,
+			sectionName: string,
+		) => Promise<void>,
+	) {
+		super(app);
+		this.folder = defaultFolder;
 	}
 
-	private openClearConfirm(): void {
-		new ConfirmModal(this.app, {
-			title: "Clear all inventory",
-			message:
-				"Are you sure you want to remove all items from inventory? This cannot be undone.",
-			confirmText: "Clear all",
-			destructive: true,
-			onConfirm: async () => {
-				try {
-					await this.deps.manager.clear();
-					new Notice("Inventory cleared");
-				} catch (e) {
-					new Notice(`Error clearing inventory: ${String(e)}`);
-				}
-			},
-		}).open();
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h2", { text: "New inventory page" });
+
+		new Setting(contentEl).setName("Name").addText((t) =>
+			t.setPlaceholder("Dry goods").onChange((v) => {
+				this.name = v;
+			}),
+		);
+		new Setting(contentEl)
+			.setName("Folder")
+			.setDesc("Vault-relative folder for the new page.")
+			.addText((t) =>
+				t.setValue(this.folder).onChange((v) => {
+					this.folder = v;
+				}),
+			);
+		new Setting(contentEl).setName("First section name").addText((t) =>
+			t.setValue(this.sectionName).onChange((v) => {
+				this.sectionName = v;
+			}),
+		);
+
+		new Setting(contentEl)
+			.addButton((btn) => btn.setButtonText("Cancel").onClick(() => this.close()))
+			.addButton((btn) =>
+				btn
+					.setButtonText("Create")
+					.setCta()
+					.onClick(() => void this.submit()),
+			);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+
+	private async submit(): Promise<void> {
+		const name = this.name.trim();
+		if (!name) {
+			new Notice("Please enter a page name.");
+			return;
+		}
+		try {
+			await this.onCreate(name, this.folder, this.sectionName.trim() || "Items");
+			this.close();
+		} catch (e) {
+			new Notice(`Error creating page: ${String(e)}`);
+		}
 	}
 }
+

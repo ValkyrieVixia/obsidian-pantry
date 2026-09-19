@@ -1,8 +1,10 @@
 import {
 	Menu,
+	Notice,
 	Plugin,
 	TAbstractFile,
 	TFile,
+	TFolder,
 	WorkspaceLeaf,
 	debounce,
 } from "obsidian";
@@ -25,14 +27,17 @@ import {
 	emptyInventoryState,
 	inventoryStateHasContent,
 	mergeInventoryState,
-	normalizeInventoryItems,
 	parseInventoryState,
 	readInventoryStateFile,
+	readLegacyInventoryItems,
 	resolveInventoryStatePath,
 	serializeInventoryState,
 	writeInventoryStateFile,
 } from "./grocery/inventory-state";
+import { serializeInventoryBody } from "./parser/inventory";
+import { inventoryTypeMatches } from "./grocery/inventory-library";
 import { recipeTypeMatches } from "./parser/recipe";
+import { InventoryItem, InventorySection } from "./types";
 import {
 	DEFAULT_CATEGORY_ORDER,
 	DEFAULT_MEAL_PLAN_SLOT_SELECTION,
@@ -45,8 +50,9 @@ import { MealPlannerView, VIEW_TYPE_MEAL_PLANNER } from "./ui/planner-view";
 import { RecipeView, VIEW_TYPE_RECIPE } from "./ui/recipe-view";
 import { GroceryListView, VIEW_TYPE_GROCERY_LIST } from "./ui/view";
 import { InventoryView, VIEW_TYPE_INVENTORY } from "./ui/inventory-view";
+import { InventoryPageView, VIEW_TYPE_INVENTORY_PAGE, isInventoryPageFile } from "./ui/inventory-page-view";
 
-/** Re-assert cadence for the recipe-view swap, and how many times to try. */
+/** Re-assert cadence for the recipe/inventory-page view swaps, and how many times to try. */
 const AUTO_OPEN_RETRY_MS = 30;
 const AUTO_OPEN_MAX_ATTEMPTS = 6;
 
@@ -58,6 +64,10 @@ export default class PantryPlugin extends Plugin {
 	private autoOpenRecipePendingPath: string | null = null;
 	/** Pending deferred recipe-view swap, so it can be cancelled/superseded. */
 	private autoOpenRecipeTimer: number | null = null;
+	/** Vault path awaiting a metadata-cache retry for inventory-page auto-open. */
+	private autoOpenInventoryPendingPath: string | null = null;
+	/** Pending deferred inventory-page-view swap, so it can be cancelled/superseded. */
+	private autoOpenInventoryTimer: number | null = null;
 	/**
 	 * Last file path observed per leaf for auto-open. Used to skip `file-open`
 	 * events that are just tab/focus returns to a leaf that already has the
@@ -86,8 +96,10 @@ export default class PantryPlugin extends Plugin {
 
 		const inventorySink: InventorySaveSink = makeInventorySaveSink(this);
 		this.inventoryManager = new InventoryManager(this.app, inventorySink);
-		await this.inventoryManager.refresh();
 
+		// Register every view type synchronously, before any awaited work below,
+		// so Obsidian always has a view creator ready if it restores a leaf of
+		// one of these types while reopening the previous workspace layout.
 		this.registerView(
 			VIEW_TYPE_GROCERY_LIST,
 			(leaf) =>
@@ -131,16 +143,28 @@ export default class PantryPlugin extends Plugin {
 				}),
 		);
 
-		this.addRibbonIcon("shopping-cart", "Open grocery list", () => {
-			void this.activateView();
+		this.registerView(
+			VIEW_TYPE_INVENTORY_PAGE,
+			(leaf) =>
+				new InventoryPageView(leaf, {
+					manager: this.inventoryManager,
+					openInMarkdown: (leaf) => this.openLeafInMarkdown(leaf),
+				}),
+		);
+
+		// Obsidian prepends each new ribbon icon above the previous ones, so
+		// the LAST call here ends up topmost. Add in reverse of the desired
+		// visual stacking (inventory at the bottom, grocery list at the top).
+		this.addRibbonIcon("archive", "Open inventory", () => {
+			void this.activateInventoryView();
 		});
 
 		this.addRibbonIcon("calendar-days", "Open meal planner", () => {
 			void this.activatePlannerView();
 		});
 
-		this.addRibbonIcon("archive", "Open pantry inventory", () => {
-			void this.activateInventoryView();
+		this.addRibbonIcon("shopping-cart", "Open grocery list", () => {
+			void this.activateView();
 		});
 
 		registerCommands({
@@ -165,6 +189,7 @@ export default class PantryPlugin extends Plugin {
 			this.app.workspace.on("file-open", (file) => {
 				if (!file) {
 					this.autoOpenRecipePendingPath = null;
+					this.autoOpenInventoryPendingPath = null;
 					return;
 				}
 				// Obsidian also fires file-open when switching back to an
@@ -175,6 +200,8 @@ export default class PantryPlugin extends Plugin {
 				}
 				this.autoOpenRecipePendingPath = file.path;
 				this.maybeAutoOpenRecipe(file);
+				this.autoOpenInventoryPendingPath = file.path;
+				this.maybeAutoOpenInventory(file);
 			}),
 		);
 
@@ -195,10 +222,21 @@ export default class PantryPlugin extends Plugin {
 		);
 
 		this.registerEvent(
+			this.app.metadataCache.on("changed", (file) => {
+				if (!this.autoOpenInventoryPendingPath) return;
+				if (file.path !== this.autoOpenInventoryPendingPath) return;
+				const active = this.app.workspace.getActiveFile();
+				if (!active || active.path !== file.path) return;
+				this.maybeAutoOpenInventory(file);
+			}),
+		);
+
+		this.registerEvent(
 			this.app.workspace.on(
 				"file-menu",
 				(menu, file, source, leaf) => {
 					this.maybeAddRecipeModeMenuItem(menu, file, source, leaf);
+					this.maybeAddInventoryModeMenuItem(menu, file, source, leaf);
 				},
 			),
 		);
@@ -214,6 +252,9 @@ export default class PantryPlugin extends Plugin {
 			}),
 		);
 
+		await this.inventoryManager.refresh();
+		await this.migrateLegacyInventory();
+
 		const refresh = debounce(
 			() => {
 				void this.manager.refresh();
@@ -221,9 +262,19 @@ export default class PantryPlugin extends Plugin {
 			500,
 			true,
 		);
+		const refreshInventory = debounce(
+			() => {
+				void this.inventoryManager.refresh();
+			},
+			500,
+			true,
+		);
 
 		this.registerEvent(
-			this.app.metadataCache.on("changed", () => refresh()),
+			this.app.metadataCache.on("changed", () => {
+				refresh();
+				refreshInventory();
+			}),
 		);
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
@@ -239,6 +290,7 @@ export default class PantryPlugin extends Plugin {
 				}
 				this.forgetLeafOpenPath(file.path);
 				refresh();
+				refreshInventory();
 			}),
 		);
 		this.registerEvent(
@@ -263,6 +315,7 @@ export default class PantryPlugin extends Plugin {
 					this.forgetLeafOpenPath(oldPath);
 				}
 				refresh();
+				refreshInventory();
 			}),
 		);
 		this.registerEvent(
@@ -303,6 +356,7 @@ export default class PantryPlugin extends Plugin {
 		void this.persistAllInventory();
 		// Leaves are detached automatically by Obsidian on unload.
 		this.clearAutoOpenRecipeTimer();
+		this.clearAutoOpenInventoryTimer();
 	}
 
 	async loadSettings(): Promise<void> {
@@ -464,6 +518,68 @@ export default class PantryPlugin extends Plugin {
 		);
 	}
 
+	/**
+	 * One-time migration for installs upgrading from the pre-file-based
+	 * inventory (a flat item list in a vault JSON file). Runs only when no
+	 * inventory pages have been found yet, so it's safe to call on every
+	 * startup — once the migrated page exists, this is a no-op forever after
+	 * (even
+	 * across devices, since the check is "do any pages already exist?"
+	 * rather than a one-shot flag).
+	 */
+	private async migrateLegacyInventory(): Promise<void> {
+		if (this.inventoryManager.getPages().length > 0) return;
+
+		const legacyItems = await readLegacyInventoryItems(
+			this.app,
+			resolveInventoryStatePath(this.settings.inventoryStatePath),
+		);
+		if (legacyItems.length === 0) return;
+
+		const folder = this.settings.inventoryFolders[0]?.trim() || "Pantry";
+		if (!(this.app.vault.getAbstractFileByPath(folder) instanceof TFolder)) {
+			try {
+				await this.app.vault.createFolder(folder);
+			} catch {
+				// Folder may already exist as a race with another process; ignore.
+			}
+		}
+
+		const bySection = new Map<string, InventoryItem[]>();
+		for (const item of legacyItems) {
+			const key = item.category?.trim() || "Items";
+			const migrated: InventoryItem = { ...item, category: null };
+			const arr = bySection.get(key);
+			if (arr) arr.push(migrated);
+			else bySection.set(key, [migrated]);
+		}
+		const sections: InventorySection[] = [...bySection.entries()].map(
+			([name, items]) => ({ name, tags: [], items, extraLines: [] }),
+		);
+
+		const property = this.settings.inventoryTypeProperty.trim() || "type";
+		const value = this.settings.inventoryTypeValue.trim() || "inventory";
+		const content = `---\n${property}: ${value}\n---\n\n${serializeInventoryBody({ preamble: "", sections })}`;
+
+		let path = `${folder}/Inventory.md`;
+		let n = 2;
+		while (this.app.vault.getAbstractFileByPath(path)) {
+			path = `${folder}/Inventory ${n}.md`;
+			n++;
+		}
+		await this.app.vault.create(path, content);
+
+		if (this.settings.inventoryFolders.length === 0) {
+			this.settings.inventoryFolders = [folder];
+		}
+		await this.saveSettings();
+		await this.inventoryManager.refresh();
+
+		new Notice(
+			`Pantry: migrated ${legacyItems.length} inventory item(s) into "${path}". Open the Inventory tab to organize them into sections.`,
+		);
+	}
+
 	async activateView(): Promise<void> {
 		const { workspace } = this.app;
 		let leaf: WorkspaceLeaf | null = null;
@@ -506,20 +622,21 @@ export default class PantryPlugin extends Plugin {
 
 	async activateInventoryView(): Promise<void> {
 		const { workspace } = this.app;
-		let leaf: WorkspaceLeaf | null = null;
-		const existing = workspace.getLeavesOfType(VIEW_TYPE_INVENTORY);
-		if (existing.length > 0) {
-			leaf = existing[0] ?? null;
-		} else {
-			leaf = workspace.getLeaf("tab");
-			await leaf.setViewState({
-				type: VIEW_TYPE_INVENTORY,
-				active: true,
-			});
-		}
+		const [leaf, ...duplicates] = workspace.getLeavesOfType(VIEW_TYPE_INVENTORY);
+		// Self-heal any duplicate tabs that may have accumulated (e.g. across
+		// reloads during development) so "open inventory" reliably reuses one tab.
+		for (const dup of duplicates) dup.detach();
 		if (leaf) {
 			await workspace.revealLeaf(leaf);
+			workspace.setActiveLeaf(leaf, { focus: true });
+			return;
 		}
+		const newLeaf = workspace.getLeaf("tab");
+		await newLeaf.setViewState({
+			type: VIEW_TYPE_INVENTORY,
+			active: true,
+		});
+		await workspace.revealLeaf(newLeaf);
 	}
 
 	/**
@@ -551,6 +668,8 @@ export default class PantryPlugin extends Plugin {
 		// user's explicit switch back to Markdown.
 		this.clearAutoOpenRecipeTimer();
 		this.autoOpenRecipePendingPath = null;
+		this.clearAutoOpenInventoryTimer();
+		this.autoOpenInventoryPendingPath = null;
 		const view = leaf.view;
 		const file =
 			view instanceof RecipeView
@@ -593,6 +712,39 @@ export default class PantryPlugin extends Plugin {
 					this.leafOpenPaths.set(leaf, file.path);
 					void leaf.setViewState({
 						type: VIEW_TYPE_RECIPE,
+						state: { file: file.path },
+						active: true,
+					});
+				});
+		});
+	}
+
+	/**
+	 * Adds an "Inventory mode" entry to the pane's 3-dot menu when the active
+	 * file is a recognised inventory page (folder + frontmatter type match)
+	 * that isn't already showing in that view.
+	 */
+	private maybeAddInventoryModeMenuItem(
+		menu: Menu,
+		file: TAbstractFile,
+		source: string,
+		leaf?: WorkspaceLeaf,
+	): void {
+		if (source !== "more-options") return;
+		if (!leaf) return;
+		if (!(file instanceof TFile)) return;
+		if (file.extension !== "md") return;
+		if (leaf.view.getViewType() === VIEW_TYPE_INVENTORY_PAGE) return;
+		if (!isInventoryPageFile(this.inventoryManager, file)) return;
+
+		menu.addItem((item) => {
+			item.setTitle("Inventory mode")
+				.setIcon("archive")
+				.setSection("pane")
+				.onClick(() => {
+					this.leafOpenPaths.set(leaf, file.path);
+					void leaf.setViewState({
+						type: VIEW_TYPE_INVENTORY_PAGE,
 						state: { file: file.path },
 						active: true,
 					});
@@ -703,6 +855,67 @@ export default class PantryPlugin extends Plugin {
 		window.clearTimeout(this.autoOpenRecipeTimer);
 		this.autoOpenRecipeTimer = null;
 	}
+
+	private maybeAutoOpenInventory(file: TFile): void {
+		if (!this.settings.autoOpenInventoryView) return;
+		if (file.extension !== "md") return;
+
+		const cache = this.app.metadataCache.getFileCache(file);
+		const fm = (cache?.frontmatter ?? {}) as Record<string, unknown>;
+		const property = this.settings.inventoryTypeProperty.trim() || "type";
+		if (!inventoryTypeMatches(fm[property], this.settings.inventoryTypeValue)) {
+			if (cache?.frontmatter !== undefined) {
+				this.autoOpenInventoryPendingPath = null;
+			}
+			return;
+		}
+
+		const leaf = this.app.workspace.getMostRecentLeaf();
+		if (!leaf) return;
+		if (leaf.view.getViewType() === VIEW_TYPE_INVENTORY_PAGE) {
+			this.autoOpenInventoryPendingPath = null;
+			return;
+		}
+
+		this.autoOpenInventoryPendingPath = null;
+		this.leafOpenPaths.set(leaf, file.path);
+		this.scheduleInventoryViewSwap(file);
+	}
+
+	/**
+	 * Swaps the active leaf to the inventory page view after Obsidian's
+	 * file-open state settles. Stops once it succeeds, times out, or the
+	 * active file changes. Mirrors {@link scheduleRecipeViewSwap}.
+	 */
+	private scheduleInventoryViewSwap(file: TFile): void {
+		this.clearAutoOpenInventoryTimer();
+		let attempts = 0;
+		const trySwap = (): void => {
+			this.autoOpenInventoryTimer = null;
+			if (this.app.workspace.getActiveFile()?.path !== file.path) return;
+			const leaf = this.app.workspace.getMostRecentLeaf();
+			if (!leaf) return;
+			if (leaf.view.getViewType() === VIEW_TYPE_INVENTORY_PAGE) return;
+			void leaf.setViewState({
+				type: VIEW_TYPE_INVENTORY_PAGE,
+				state: { file: file.path },
+				active: true,
+			});
+			if (++attempts < AUTO_OPEN_MAX_ATTEMPTS) {
+				this.autoOpenInventoryTimer = window.setTimeout(
+					trySwap,
+					AUTO_OPEN_RETRY_MS,
+				);
+			}
+		};
+		this.autoOpenInventoryTimer = window.setTimeout(trySwap, 0);
+	}
+
+	private clearAutoOpenInventoryTimer(): void {
+		if (this.autoOpenInventoryTimer === null) return;
+		window.clearTimeout(this.autoOpenInventoryTimer);
+		this.autoOpenInventoryTimer = null;
+	}
 }
 
 function makeSaveSink(plugin: PantryPlugin): SaveSink {
@@ -780,6 +993,10 @@ function mergeSettings(raw: Partial<PantrySettings> | null): PantrySettings {
 			typeof raw.recipeTypeValue === "string" && raw.recipeTypeValue.trim()
 				? raw.recipeTypeValue.trim()
 				: base.recipeTypeValue,
+		autoOpenInventoryView:
+			typeof raw.autoOpenInventoryView === "boolean"
+				? raw.autoOpenInventoryView
+				: base.autoOpenInventoryView,
 		state: {
 			oneOffs: Array.isArray(raw.state?.oneOffs)
 				? (raw.state?.oneOffs ?? [])
@@ -803,6 +1020,18 @@ function mergeSettings(raw: Partial<PantrySettings> | null): PantrySettings {
 		recipeFolders: Array.isArray(raw.recipeFolders)
 			? raw.recipeFolders
 			: base.recipeFolders,
+		inventoryFolders: Array.isArray(raw.inventoryFolders)
+			? raw.inventoryFolders
+			: base.inventoryFolders,
+		inventoryTypeProperty:
+			typeof raw.inventoryTypeProperty === "string" &&
+			raw.inventoryTypeProperty.trim()
+				? raw.inventoryTypeProperty.trim()
+				: base.inventoryTypeProperty,
+		inventoryTypeValue:
+			typeof raw.inventoryTypeValue === "string" && raw.inventoryTypeValue.trim()
+				? raw.inventoryTypeValue.trim()
+				: base.inventoryTypeValue,
 		myAllergens: Array.isArray(raw.myAllergens)
 			? raw.myAllergens
 					.filter((s): s is string => typeof s === "string")
@@ -908,18 +1137,35 @@ function mergeSettings(raw: Partial<PantrySettings> | null): PantrySettings {
 				? raw.excludeInStockFromGrocery
 				: base.excludeInStockFromGrocery,
 		inventoryState: {
-			items: normalizeInventoryItems(raw.inventoryState?.items),
 			collapsedGroups:
 				raw.inventoryState?.collapsedGroups &&
 				typeof raw.inventoryState.collapsedGroups === "object"
 					? { ...raw.inventoryState.collapsedGroups }
 					: {},
-			groupBy: raw.inventoryState?.groupBy === "tag" ? "tag" : "category",
+			groupBy:
+				raw.inventoryState?.groupBy === "section" ||
+				raw.inventoryState?.groupBy === "tag"
+					? raw.inventoryState.groupBy
+					: "flat",
 			rowScale:
 				typeof raw.inventoryState?.rowScale === "number" &&
 				Number.isFinite(raw.inventoryState.rowScale)
 					? Math.min(1.4, Math.max(0.8, raw.inventoryState.rowScale))
 					: 1,
+			filterTags: Array.isArray(raw.inventoryState?.filterTags)
+				? raw.inventoryState.filterTags.filter(
+						(t): t is string => typeof t === "string",
+					)
+				: [],
+			sectionFilter: Array.isArray(raw.inventoryState?.sectionFilter)
+				? raw.inventoryState.sectionFilter.filter(
+						(t): t is string => typeof t === "string",
+					)
+				: [],
+			lastManagedPage:
+				typeof raw.inventoryState?.lastManagedPage === "string"
+					? raw.inventoryState.lastManagedPage
+					: "",
 		},
 	};
 	return merged;

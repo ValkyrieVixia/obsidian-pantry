@@ -1,19 +1,23 @@
 import { App, CachedMetadata, TFile } from "obsidian";
 import { PantrySettings, RECIPE_FRONTMATTER } from "../settings";
-import { listMarkdownFilesInRecipeFolders } from "../utils/vault-files";
+import { fileInFolders, listMarkdownFilesInRecipeFolders } from "../utils/vault-files";
 import { RecipeIngredient } from "../types";
 import { regexCapture, stripWikiLink, trimEndText, trimText } from "../utils/text";
 import { hasIgnoreTag, parseIngredientLine } from "./ingredient";
 
 /**
- * Does a note's recipe-type frontmatter value match the configured target?
+ * Does a frontmatter value match the configured target?
  *
  * Matching is case-insensitive and tolerant of how Obsidian stores the value:
  * a plain string, a wikilink (`[[Recipes]]`), or a list mixing either. Each
  * candidate is unwrapped via {@link stripWikiLink} before comparison so a note
- * with `type: [[Recipes]]` matches a configured value of `Recipes`.
+ * with `type: [[Recipes]]` matches a configured value of `Recipes`. Shared by
+ * the recipe-type check and the inventory-page-type check.
  */
-export function recipeTypeMatches(fmValue: unknown, target: string): boolean {
+export function frontmatterValueMatches(
+	fmValue: unknown,
+	target: string,
+): boolean {
 	const wanted = target.trim().toLowerCase();
 	if (!wanted) return false;
 
@@ -31,14 +35,17 @@ export function recipeTypeMatches(fmValue: unknown, target: string): boolean {
 	);
 }
 
+/**
+ * Does a note's recipe-type frontmatter value match the configured target?
+ * See {@link frontmatterValueMatches} for the matching rules.
+ */
+export function recipeTypeMatches(fmValue: unknown, target: string): boolean {
+	return frontmatterValueMatches(fmValue, target);
+}
+
 /** Returns true if the file lives inside one of the configured folders (or all are empty). */
 export function fileInRecipeFolders(file: TFile, folders: string[]): boolean {
-	if (folders.length === 0) return true;
-	return folders.some((folder) => {
-		const f = folder.replace(/\/+$/, "");
-		if (!f) return true;
-		return file.path === f || file.path.startsWith(`${f}/`);
-	});
+	return fileInFolders(file, folders);
 }
 
 /**

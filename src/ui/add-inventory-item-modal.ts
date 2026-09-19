@@ -1,57 +1,92 @@
 import { App, Modal, Notice, Setting, setIcon } from "obsidian";
-import { InventoryItem, ShopLink } from "../types";
+import { InventoryManager, newInventoryItem } from "../grocery/inventory-manager";
+import { StringSuggest } from "./name-suggest";
+import { InventoryEntry, ShopLink } from "../types";
 
 /** Maximum number of shop links per inventory item. */
 const MAX_SHOP_LINKS = 4;
 
 /**
- * Modal that adds or edits an inventory item's descriptive fields.
- * Stock status (In) is toggled directly on the item card.
+ * Modal that adds a new inventory item or edits an existing one.
+ *
+ * New items pick a page + section to live in (or create either on the fly);
+ * editing an existing item keeps it on its current page but still allows
+ * moving it to a different section. Have/want quantity is adjusted directly
+ * on the item row's stepper, not here.
  */
 export class AddItemModal extends Modal {
 	private name: string;
 	private unit: string;
-	private category: string;
 	private expirationDate: string;
 	private notes: string;
 	private tagsText: string;
 	private shopLinks: ShopLink[];
 	private shopLinksEl!: HTMLElement;
-	private readonly existing: InventoryItem | null;
+	private pickerEl!: HTMLElement;
+	private readonly existingEntry: InventoryEntry | null;
+
+	/** Target page/section for a new item, or the current section while editing. */
+	private filePath: string;
+	private sectionName: string;
+	private newPageMode = false;
+	private newPageName = "";
+	private newPageFolder: string;
+	private newSectionMode = false;
+	private newSectionName = "Items";
 
 	constructor(
 		app: App,
-		private readonly onSave: (item: InventoryItem) => Promise<void>,
-		existing?: InventoryItem,
+		private readonly manager: InventoryManager,
+		defaultContext: { filePath: string; sectionName: string },
+		existingEntry?: InventoryEntry,
 	) {
 		super(app);
-		this.existing = existing ?? null;
-		this.name = existing?.name ?? "";
-		this.unit = existing?.unit ?? "";
-		this.category = existing?.category ?? "";
-		this.expirationDate = existing?.expirationDate ?? "";
-		this.notes = existing?.notes ?? "";
-		this.tagsText = (existing?.tags ?? []).join(", ");
-		this.shopLinks = (existing?.shopLinks ?? []).map((l) => ({ ...l }));
+		this.existingEntry = existingEntry ?? null;
+		const item = existingEntry?.item;
+		this.name = item?.name ?? "";
+		this.unit = item?.unit ?? "";
+		this.expirationDate = item?.expirationDate ?? "";
+		this.notes = item?.notes ?? "";
+		this.tagsText = (item?.tags ?? []).join(", ");
+		this.shopLinks = (item?.shopLinks ?? []).map((l) => ({ ...l }));
+
+		this.filePath = existingEntry?.filePath ?? defaultContext.filePath;
+		this.sectionName = existingEntry?.sectionName ?? defaultContext.sectionName;
+		this.newPageFolder = manager.getPages()[0]?.file.parent?.path ?? "";
+		if (!this.filePath && manager.getPages().length === 0) {
+			this.newPageMode = true;
+		}
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
 		contentEl.empty();
 
-		const editing = this.existing !== null;
+		const editing = this.existingEntry !== null;
 		contentEl.createEl("h2", {
-			text: editing ? "Edit Inventory Item" : "Add Inventory Item",
+			text: editing ? "Edit inventory item" : "Add inventory item",
 		});
 
-		new Setting(contentEl).setName("Name").addText((text) =>
+		new Setting(contentEl).setName("Name").addText((text) => {
 			text
 				.setPlaceholder("Item name")
 				.setValue(this.name)
 				.onChange((value) => {
 					this.name = value;
-				}),
-		);
+				});
+			new StringSuggest(
+				this.app,
+				text.inputEl,
+				() => this.manager.getKnownItemNames(),
+				(value) => {
+					this.name = value;
+					if (!editing) this.prefillFromExisting(value);
+				},
+			);
+		});
+
+		this.pickerEl = contentEl.createDiv({ cls: "pantry-inventory-picker" });
+		this.renderPicker();
 
 		new Setting(contentEl).setName("Unit").addText((text) =>
 			text
@@ -63,20 +98,8 @@ export class AddItemModal extends Modal {
 		);
 
 		new Setting(contentEl)
-			.setName("Category")
-			.setDesc("Optional category for organizing your inventory.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Pantry, freezer, or fridge")
-					.setValue(this.category)
-					.onChange((value) => {
-						this.category = value;
-					}),
-			);
-
-		new Setting(contentEl)
 			.setName("Tags")
-			.setDesc("Labels for filtering and organizing items.")
+			.setDesc("Labels for filtering and organizing items, on top of the section's own tags.")
 			.addText((text) =>
 				text
 					.setPlaceholder("E.g., baking, breakfast")
@@ -186,6 +209,105 @@ export class AddItemModal extends Modal {
 		this.contentEl.empty();
 	}
 
+	/** Copies unit/tags/expiration/shop links from the most recent match, for one-click refills. */
+	private prefillFromExisting(name: string): void {
+		const match = this.manager.findMostRecentItemByName(name);
+		if (!match) return;
+		this.unit = match.unit;
+		this.tagsText = match.tags.join(", ");
+		this.expirationDate = "";
+		this.notes = match.notes ?? "";
+		this.shopLinks = match.shopLinks.map((l) => ({ ...l }));
+		this.onOpen();
+	}
+
+	/** Page + section picker. Editing keeps the page fixed but still allows re-sectioning. */
+	private renderPicker(): void {
+		this.pickerEl.empty();
+		const pages = this.manager.getPages();
+
+		if (this.existingEntry) {
+			new Setting(this.pickerEl)
+				.setName("Inventory page")
+				.setDesc(this.existingEntry.pageName);
+			this.renderSectionPicker(pages.find((p) => p.file.path === this.filePath)?.page.sections ?? []);
+			return;
+		}
+
+		new Setting(this.pickerEl).setName("Inventory page").addDropdown((dd) => {
+			for (const p of pages) dd.addOption(p.file.path, p.file.basename);
+			dd.addOption("__new__", "New inventory page…");
+			dd.setValue(this.newPageMode || pages.length === 0 ? "__new__" : this.filePath);
+			dd.onChange((value) => {
+				if (value === "__new__") {
+					this.newPageMode = true;
+				} else {
+					this.newPageMode = false;
+					this.filePath = value;
+					const page = pages.find((p) => p.file.path === value)?.page;
+					this.sectionName = page?.sections[0]?.name ?? "Items";
+				}
+				this.renderPicker();
+			});
+		});
+
+		if (this.newPageMode || pages.length === 0) {
+			new Setting(this.pickerEl).setName("Page name").addText((t) =>
+				t
+					.setPlaceholder("Dry goods")
+					.setValue(this.newPageName)
+					.onChange((v) => {
+						this.newPageName = v;
+					}),
+			);
+			new Setting(this.pickerEl)
+				.setName("Folder")
+				.setDesc("Vault-relative folder for the new page.")
+				.addText((t) =>
+					t.setValue(this.newPageFolder).onChange((v) => {
+						this.newPageFolder = v;
+					}),
+				);
+			new Setting(this.pickerEl).setName("First section name").addText((t) =>
+				t.setValue(this.newSectionName).onChange((v) => {
+					this.newSectionName = v;
+				}),
+			);
+			return;
+		}
+
+		const page = pages.find((p) => p.file.path === this.filePath)?.page;
+		this.renderSectionPicker(page?.sections ?? []);
+	}
+
+	private renderSectionPicker(sections: Array<{ name: string }>): void {
+		new Setting(this.pickerEl).setName("Section").addDropdown((dd) => {
+			for (const s of sections) dd.addOption(s.name, s.name);
+			dd.addOption("__new__", "New section…");
+			dd.setValue(this.newSectionMode || sections.length === 0 ? "__new__" : this.sectionName);
+			dd.onChange((value) => {
+				if (value === "__new__") {
+					this.newSectionMode = true;
+				} else {
+					this.newSectionMode = false;
+					this.sectionName = value;
+				}
+				this.renderPicker();
+			});
+		});
+
+		if (this.newSectionMode || sections.length === 0) {
+			new Setting(this.pickerEl).setName("New section name").addText((t) =>
+				t
+					.setPlaceholder("Pantry, cabinet")
+					.setValue(this.newSectionName)
+					.onChange((v) => {
+						this.newSectionName = v;
+					}),
+			);
+		}
+	}
+
 	private async submit(): Promise<void> {
 		const name = this.name.trim();
 
@@ -195,7 +317,6 @@ export class AddItemModal extends Modal {
 		}
 
 		const unit = this.unit.trim();
-		const category = this.category.trim() || null;
 		const expirationDate = this.expirationDate.trim() || null;
 		const notes = this.notes.trim() || null;
 		const tags = this.tagsText
@@ -206,22 +327,42 @@ export class AddItemModal extends Modal {
 			.map((l) => ({ nickname: l.nickname.trim(), url: l.url.trim() }))
 			.filter((l) => l.url !== "");
 
-		const item: InventoryItem = {
-			id: this.existing?.id ?? generateItemId(),
-			name,
-			// New staples default to in-stock.
-			inStock: this.existing?.inStock ?? true,
-			unit,
-			category,
-			expirationDate,
-			notes,
-			tags,
-			shopLinks,
-			dateAdded: this.existing?.dateAdded ?? new Date().toISOString(),
-		};
+		const fieldUpdates = { name, unit, expirationDate, notes, tags, shopLinks };
 
 		try {
-			await this.onSave(item);
+			if (this.existingEntry) {
+				await this.manager.updateItem(
+					this.existingEntry.filePath,
+					this.existingEntry.item.id,
+					fieldUpdates,
+				);
+				const targetSection = this.newSectionMode
+					? this.newSectionName.trim() || "Section"
+					: this.sectionName;
+				if (targetSection !== this.existingEntry.sectionName) {
+					await this.manager.moveItem(
+						this.existingEntry.filePath,
+						this.existingEntry.item.id,
+						targetSection,
+					);
+				}
+			} else {
+				const item = { ...newInventoryItem(name), ...fieldUpdates };
+				if (this.newPageMode || this.manager.getPages().length === 0) {
+					const sectionName = this.newSectionName.trim() || "Items";
+					const file = await this.manager.createPage(
+						this.newPageName,
+						this.newPageFolder,
+						sectionName,
+					);
+					await this.manager.addItem(file.path, sectionName, item);
+				} else {
+					const sectionName = this.newSectionMode
+						? this.newSectionName.trim() || "Section"
+						: this.sectionName;
+					await this.manager.addItem(this.filePath, sectionName, item);
+				}
+			}
 			this.close();
 		} catch (e) {
 			new Notice(`Error saving item: ${String(e)}`);
@@ -229,8 +370,3 @@ export class AddItemModal extends Modal {
 	}
 }
 
-function generateItemId(): string {
-	return `${Date.now().toString(36)}-${Math.random()
-		.toString(36)
-		.slice(2, 8)}`;
-}

@@ -139,7 +139,7 @@ function extractTrailingNotes(text: string): {
  * Only tags that appear at the very end of the line are extracted, so an
  * inline `#1` in something like `pan #1` is left alone.
  */
-function extractTrailingTags(text: string): { text: string; tags: string[] } {
+export function extractTrailingTags(text: string): { text: string; tags: string[] } {
 	const match = text.match(/((?:\s+#[\w/-]+)+)\s*$/);
 	if (!match) return { text: text.trim(), tags: [] };
 	const tagBlock = match[1] ?? "";

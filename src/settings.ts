@@ -3,7 +3,6 @@ import {
 	CategoryOverride,
 	CategorySource,
 	GroupingMode,
-	InventoryItem,
 	OneOffItem,
 } from "./types";
 
@@ -16,6 +15,14 @@ export const DEFAULT_INVENTORY_STATE_PATH = "Pantry/inventory-state.json";
 export interface PantrySettings {
 	/** Folder paths (vault-relative) to scan for recipes. Empty array = entire vault. */
 	recipeFolders: string[];
+	/** Folder paths (vault-relative) to scan for inventory pages. Empty array = entire vault. */
+	inventoryFolders: string[];
+	/** Frontmatter property name read to identify an inventory page note (default: "type"). */
+	inventoryTypeProperty: string;
+	/** The frontmatter value (under `inventoryTypeProperty`) that marks an inventory page (default: "inventory"). */
+	inventoryTypeValue: string;
+	/** Auto-open notes whose inventory-type frontmatter matches `inventoryTypeValue` in the inventory page view. */
+	autoOpenInventoryView: boolean;
 	/** Frontmatter property name that marks a recipe as selected for the week. */
 	selectionProperty: string;
 	/** Heading whose bullet list contains the recipe's ingredients. */
@@ -88,9 +95,10 @@ export interface PantrySettings {
 	 */
 	state: PantrySavedState;
 	/**
-	 * Vault-relative JSON file for pantry inventory items.
-	 * Lives in the vault so Obsidian Sync / folder sync keeps inventory
-	 * in sync across devices.
+	 * Vault-relative JSON file for the inventory tab's view state (grouping,
+	 * filters, collapsed groups, zoom). Item data lives in inventory page
+	 * notes themselves, not here. Stored in the vault so Obsidian Sync /
+	 * folder sync keeps this in sync across devices.
 	 */
 	inventoryStatePath: string;
 	/**
@@ -100,8 +108,9 @@ export interface PantrySettings {
 	 */
 	excludeInStockFromGrocery: boolean;
 	/**
-	 * In-memory inventory runtime state. Persisted to {@link inventoryStatePath}
-	 * in the vault — not to plugin data.json.
+	 * In-memory inventory *view* state (grouping/filtering/collapsed sections).
+	 * Persisted to {@link inventoryStatePath} in the vault — not to plugin
+	 * data.json. Item data itself now lives in inventory page notes, not here.
 	 */
 	inventoryState: PantrySavedInventoryState;
 }
@@ -124,17 +133,30 @@ export interface PantrySavedState {
 }
 
 export interface PantrySavedInventoryState {
-	/** Items in the user's pantry inventory. */
-	items: InventoryItem[];
 	/**
-	 * Map from category name to whether the user has it collapsed.
-	 * Missing entries default to expanded.
+	 * Map from group name (section or tag, depending on {@link groupBy}) to
+	 * whether the user has it collapsed. Missing entries default to expanded.
 	 */
 	collapsedGroups: Record<string, boolean>;
-	/** How inventory items are grouped in the inventory view. */
-	groupBy: "category" | "tag";
+	/**
+	 * How the overview list is laid out: one combined master list ("flat"),
+	 * broken down by the section each item lives in ("section"), or grouped
+	 * by tag/indicator ("tag").
+	 */
+	groupBy: "flat" | "section" | "tag";
 	/** Row density multiplier for the inventory view (1 = default size). */
 	rowScale: number;
+	/** Tags currently selected to filter the overview list. Empty = show all. */
+	filterTags: string[];
+	/**
+	 * Sections (keyed `filePath::sectionName`) currently selected to filter
+	 * the overview list, same OR-match/empty-means-all semantics as
+	 * {@link filterTags} — a scope filter for "just show me a subset of my
+	 * inventory right now".
+	 */
+	sectionFilter: string[];
+	/** Last inventory page selected in "Manage pages" mode (vault path). */
+	lastManagedPage: string;
 }
 
 export const DEFAULT_CATEGORY_ORDER = [
@@ -242,6 +264,10 @@ export function activeMealDays(settings: PantrySettings): string[] {
 
 export const DEFAULT_SETTINGS: PantrySettings = {
 	recipeFolders: [],
+	inventoryFolders: [],
+	inventoryTypeProperty: "type",
+	inventoryTypeValue: "inventory",
+	autoOpenInventoryView: true,
 	selectionProperty: "groceryList",
 	ingredientsHeading: "Ingredients",
 	instructionsHeading: "Instructions",
@@ -281,10 +307,12 @@ export const DEFAULT_SETTINGS: PantrySettings = {
 	inventoryStatePath: DEFAULT_INVENTORY_STATE_PATH,
 	excludeInStockFromGrocery: true,
 	inventoryState: {
-		items: [],
 		collapsedGroups: {},
-		groupBy: "category",
+		groupBy: "flat",
 		rowScale: 1,
+		filterTags: [],
+		sectionFilter: [],
+		lastManagedPage: "",
 	},
 };
 
