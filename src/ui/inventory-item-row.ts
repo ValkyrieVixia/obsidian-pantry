@@ -1,4 +1,4 @@
-import { App, Notice, setIcon } from "obsidian";
+import { App, Menu, Notice, setIcon } from "obsidian";
 import { InventoryManager, newInventoryItem } from "../grocery/inventory-manager";
 import { InventoryEntry, InventoryItem, InventorySection } from "../types";
 import { toTitleCase } from "../utils/text";
@@ -15,6 +15,14 @@ import { ConfirmModal } from "./confirm-modal";
 
 /** Delay (ms) before the hover card appears on row mouseover. */
 const HOVER_CARD_DELAY_MS = 1500;
+
+/** Drag data MIME type used to move an item by dragging its card onto a section/group. */
+const DRAG_ITEM_TYPE = "application/x-pantry-inventory-item";
+
+interface DragPayload {
+	filePath: string;
+	itemId: string;
+}
 
 /**
  * Everything a view needs to share for rendering item rows/section cards:
@@ -46,6 +54,81 @@ export function openEditItemModal(app: App, manager: InventoryManager, entry: In
 		{ filePath: entry.filePath, sectionName: entry.sectionName },
 		entry,
 	).open();
+}
+
+/**
+ * Small anchored menu listing every other section (across every page) as a
+ * one-click move target — lighter than a full modal for sending an item to
+ * a different list. Built on Obsidian's own Menu so positioning, scrolling,
+ * and outside-click/Escape dismissal all come for free.
+ */
+function openMoveMenu(ctx: RowContext, anchorEl: HTMLElement, entry: InventoryEntry): void {
+	const menu = new Menu();
+
+	const targets: Array<{ filePath: string; pageName: string; sectionName: string }> = [];
+	for (const { file, page } of ctx.manager.getPages()) {
+		for (const section of page.sections) {
+			if (file.path === entry.filePath && section.name === entry.sectionName) continue;
+			targets.push({ filePath: file.path, pageName: file.basename, sectionName: section.name });
+		}
+	}
+
+	if (targets.length === 0) {
+		menu.addItem((item) => item.setTitle("No other lists yet").setDisabled(true));
+	} else {
+		let currentPage = "";
+		for (const target of targets) {
+			if (target.pageName !== currentPage) {
+				currentPage = target.pageName;
+				menu.addItem((item) => item.setTitle(target.pageName).setIsLabel(true));
+			}
+			menu.addItem((item) =>
+				item.setTitle(target.sectionName).onClick(() => {
+					void ctx.manager.moveItemToPage(
+						entry.filePath,
+						entry.item.id,
+						target.filePath,
+						target.sectionName,
+					);
+					new Notice(`Moved to ${target.pageName} › ${target.sectionName}`);
+				}),
+			);
+		}
+	}
+
+	const rect = anchorEl.getBoundingClientRect();
+	menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+}
+
+/**
+ * Makes `el` a drop target for item cards dragged from anywhere in the
+ * inventory (Overview groups, section cards, even the standalone page
+ * view) — dropping calls the same cross-page move used by the popover.
+ */
+export function wireItemDropTarget(
+	ctx: RowContext,
+	el: HTMLElement,
+	targetFilePath: string,
+	targetSectionName: string,
+): void {
+	el.addEventListener("dragover", (evt) => {
+		if (!evt.dataTransfer?.types.includes(DRAG_ITEM_TYPE)) return;
+		evt.preventDefault();
+		evt.dataTransfer.dropEffect = "move";
+		el.addClass("is-drop-target");
+	});
+	el.addEventListener("dragleave", (evt) => {
+		if (evt.relatedTarget instanceof Node && el.contains(evt.relatedTarget)) return;
+		el.removeClass("is-drop-target");
+	});
+	el.addEventListener("drop", (evt) => {
+		evt.preventDefault();
+		el.removeClass("is-drop-target");
+		const raw = evt.dataTransfer?.getData(DRAG_ITEM_TYPE);
+		if (!raw) return;
+		const payload = JSON.parse(raw) as DragPayload;
+		void ctx.manager.moveItemToPage(payload.filePath, payload.itemId, targetFilePath, targetSectionName);
+	});
 }
 
 export function confirmRemoveItem(app: App, manager: InventoryManager, entry: InventoryEntry): void {
@@ -247,10 +330,6 @@ export function renderQtyStepper(ctx: RowContext, container: HTMLElement, entry:
 	wantInput.addEventListener("change", () =>
 		commit({ desiredQuantity: Math.max(0, Number(wantInput.value) || 0) }),
 	);
-
-	if (item.unit) {
-		stepper.createSpan({ cls: "pantry-qty-unit", text: item.unit });
-	}
 }
 
 /** Renders one item row: status icon, qty stepper, name (+ optional page/section badge), shop links, edit/remove actions. */
@@ -266,6 +345,7 @@ export function renderItemRow(
 		attr: { tabindex: "0" },
 	});
 	li.dataset.rowKey = rowKey(entry);
+	li.draggable = true;
 
 	li.addEventListener("focus", () => {
 		ctx.focus.key = rowKey(entry);
@@ -273,6 +353,14 @@ export function renderItemRow(
 	li.addEventListener("keydown", (evt) => onRowKeydown(ctx, evt, li, entry));
 	li.addEventListener("mouseenter", () => scheduleHoverCard(ctx, li, entry));
 	li.addEventListener("mouseleave", () => cancelHoverCard(ctx));
+	li.addEventListener("dragstart", (evt) => {
+		cancelHoverCard(ctx);
+		const payload: DragPayload = { filePath: entry.filePath, itemId: item.id };
+		evt.dataTransfer?.setData(DRAG_ITEM_TYPE, JSON.stringify(payload));
+		if (evt.dataTransfer) evt.dataTransfer.effectAllowed = "move";
+		li.addClass("is-dragging");
+	});
+	li.addEventListener("dragend", () => li.removeClass("is-dragging"));
 
 	const status = getItemStatus(item);
 	const statusIcon = li.createSpan({ cls: "pantry-item-status pantry-col-status" });
@@ -283,7 +371,11 @@ export function renderItemRow(
 	renderQtyStepper(ctx, li, entry);
 
 	const nameWrap = li.createDiv({ cls: "pantry-name-wrap pantry-col-name" });
-	nameWrap.createSpan({ cls: "pantry-name", text: toTitleCase(item.name) });
+	const nameLine = nameWrap.createDiv({ cls: "pantry-name-line" });
+	nameLine.createSpan({ cls: "pantry-name", text: toTitleCase(item.name) });
+	if (item.unit) {
+		nameLine.createSpan({ cls: "pantry-item-unit", text: item.unit });
+	}
 	if (opts.showLocation) {
 		nameWrap.createSpan({
 			cls: "pantry-item-location",
@@ -302,6 +394,16 @@ export function renderItemRow(
 	});
 	setIcon(editBtn, "pencil");
 	editBtn.addEventListener("click", () => openEditItemModal(ctx.app, ctx.manager, entry));
+
+	const moveBtn = actions.createEl("button", {
+		cls: "clickable-icon",
+		attr: { title: "Move to another list" },
+	});
+	setIcon(moveBtn, "send");
+	moveBtn.addEventListener("click", (evt) => {
+		evt.stopPropagation();
+		openMoveMenu(ctx, moveBtn, entry);
+	});
 
 	const removeBtn = actions.createEl("button", {
 		cls: "clickable-icon pantry-remove",
@@ -362,6 +464,7 @@ export function renderSectionCard(
 	section: InventorySection,
 ): void {
 	const card = container.createDiv({ cls: "pantry-section-card" });
+	wireItemDropTarget(ctx, card, filePath, section.name);
 	const header = card.createDiv({ cls: "pantry-section-header" });
 
 	const nameInput = header.createEl("input", {

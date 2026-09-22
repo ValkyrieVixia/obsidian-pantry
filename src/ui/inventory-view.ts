@@ -21,6 +21,7 @@ import {
 	renderItemRow,
 	renderSectionCard,
 	restoreFocus,
+	wireItemDropTarget,
 	wireQuickAddRow,
 } from "./inventory-item-row";
 
@@ -293,6 +294,10 @@ export class InventoryView extends ItemView {
 					this.deps.manager.isGroupCollapsed(groupName) ? " is-collapsed" : ""
 				}`,
 			});
+			if (groupBy === "section") {
+				const first = groupEntries[0];
+				if (first) wireItemDropTarget(this.rowCtx, group, first.filePath, first.sectionName);
+			}
 
 			const header = group.createEl("button", { cls: "pantry-group-header" });
 			header.addEventListener("click", () => this.toggleGroupCollapsed(groupName));

@@ -369,6 +369,45 @@ export class InventoryManager extends Events {
 		await this.writePage(entry.file, page);
 	}
 
+	/** Move an item to a section on a different page, creating the section if needed. */
+	async moveItemToPage(
+		sourceFilePath: string,
+		itemId: string,
+		targetFilePath: string,
+		targetSectionName: string,
+	): Promise<void> {
+		if (sourceFilePath === targetFilePath) {
+			await this.moveItem(sourceFilePath, itemId, targetSectionName);
+			return;
+		}
+		const sourceEntry = this.requirePage(sourceFilePath);
+		const targetEntry = this.requirePage(targetFilePath);
+		const sourcePage = clonePage(sourceEntry.page);
+		let moved: InventoryItem | null = null;
+		for (const section of sourcePage.sections) {
+			const item = section.items.find((i) => i.id === itemId);
+			if (item) {
+				moved = item;
+				break;
+			}
+		}
+		if (!moved) return;
+
+		const targetPage = clonePage(targetEntry.page);
+		findOrCreateSection(targetPage, targetSectionName).items.push(moved);
+		// Write the target before removing from the source so a failure here never loses the item.
+		await this.writePage(targetEntry.file, targetPage);
+
+		for (const section of sourcePage.sections) {
+			const idx = section.items.findIndex((i) => i.id === itemId);
+			if (idx !== -1) {
+				section.items.splice(idx, 1);
+				break;
+			}
+		}
+		await this.writePage(sourceEntry.file, sourcePage);
+	}
+
 	/** Add a new section to a page. No-ops if a section with that name already exists. */
 	async addSection(filePath: string, name: string, tags: string[]): Promise<void> {
 		const entry = this.requirePage(filePath);
